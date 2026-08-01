@@ -19,8 +19,8 @@ cameras:
 model:
   person_model: "models/yolov8n.onnx"
   smoking_model: "models/smoking.onnx"
-  confidence_threshold: 0.30
-  iou_threshold: 0.45
+  confidence_threshold: 0.35
+  iou_threshold: 0.30
 
 # ============================================================
 # 性能调优 - 毫秒级检测关键参数

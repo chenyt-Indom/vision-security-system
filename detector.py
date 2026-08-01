@@ -46,8 +46,9 @@ class MultiStageDetector:
         smoke_out_shape = self._smoke_session.get_outputs()[0].shape
         self._smoke_num_classes = smoke_out_shape[1] - 4 if len(smoke_out_shape) >= 2 else 1
 
-        # 追踪器
-        self._tracker = PersonTracker(max_missed=15, iou_thresh=0.3)
+        # 追踪器 — Kalman滤波 + 毫秒级连续追踪
+        self._tracker = PersonTracker(max_missed=3, iou_thresh=0.2)
+        self._min_person_area = 5000  # 最小人体面积（过滤误检）
 
         # 预分配预处理数组（避免每帧分配）
         self._person_blob = np.zeros((1, 3, self._person_img_size, self._person_img_size), dtype=np.float32)
@@ -174,7 +175,7 @@ class MultiStageDetector:
             self._frame_count = 0
 
         return {
-            "persons": [{"id": t.id, "bbox": t.bbox,
+            "persons": [{"id": t.id, "bbox": t.smoothed_bbox if t.smoothed_bbox else t.bbox,
                          "hand_roi": t.hand_roi, "hand_left_roi": t.hand_left_roi, "mouth_roi": t.mouth_roi}
                         for t in tracked],
             "alerts": all_alerts,
@@ -215,6 +216,9 @@ class MultiStageDetector:
             y1 = int((cy - bh / 2) * scale_y)
             x2 = int((cx + bw / 2) * scale_x)
             y2 = int((cy + bh / 2) * scale_y)
+            area = (x2 - x1) * (y2 - y1)
+            if area < self._min_person_area:
+                continue  # 过滤太小的误检框
             detections.append([x1, y1, x2, y2, float(person_scores[idx])])
 
         return detections
