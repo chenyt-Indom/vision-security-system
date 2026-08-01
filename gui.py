@@ -351,45 +351,48 @@ class DetectionGUI:
             # 多级检测
             result = self._detector.detect(frame)
 
-            # 更新缓存（供显示线程使用）
+            # 更新缓存（供显示线程使用，存完整结果）
             with self._detect_cache_lock:
                 self._detect_cache[cam.id] = result
 
-            # 告警处理
-            alert_detected = False
+            # 用 RL 自适应阈值过滤告警
+            valid_alerts = []
             for alert in result["alerts"]:
                 label = alert["label"]
                 conf = alert["confidence"]
-                tid = alert["track_id"]
-
                 rl_threshold = self._rl.get_threshold(label)
                 if conf < rl_threshold:
                     continue
+                valid_alerts.append(alert)
 
+            # 人物去重：同一人30秒内只保留最高置信度
+            deduped_alerts = []
+            for alert in valid_alerts:
+                tid = alert["track_id"]
                 person_key = f"{cam.id}_{tid}"
                 now = time.time()
                 if person_key in last_alert_time:
                     last_time, last_conf, _ = last_alert_time[person_key]
                     if now - last_time < 30:
-                        if conf > last_conf:
-                            last_alert_time[person_key] = (now, conf, alert["bbox"])
+                        if alert["confidence"] > last_conf:
+                            last_alert_time[person_key] = (now, alert["confidence"], alert["bbox"])
                         continue
-                last_alert_time[person_key] = (now, conf, alert["bbox"])
-                alert_detected = True
+                last_alert_time[person_key] = (now, alert["confidence"], alert["bbox"])
+                deduped_alerts.append(alert)
 
-            # 决策链 + 即时推送告警图片至后台
-            if alert_detected:
-                should_alert, detail = self._decision.evaluate(cam.id, result["alerts"])
+            # 决策链：对 RL 过滤后的告警做连续帧确认
+            if deduped_alerts:
+                should_alert, detail = self._decision.evaluate(cam.id, deduped_alerts)
                 if should_alert:
-                    self._push_alert(cam, frame, result, detail)
+                    self._push_alert(cam, frame, result, deduped_alerts, detail)
 
             elapsed = (time.perf_counter() - t0) * 1000
             if elapsed < 1.0:
-                pass  # 可在此记录毫秒级性能
+                pass  # 毫秒级性能在此记录
 
-    def _push_alert(self, cam, frame, result, detail):
+    def _push_alert(self, cam, frame, result, deduped_alerts, detail):
         """即时推送告警：保存截图 + 写入数据库 + 更新前端"""
-        best_alert = max(result["alerts"], key=lambda a: a["confidence"])
+        best_alert = max(deduped_alerts, key=lambda a: a["confidence"])
         detail["detected_label"] = best_alert["label"]
         detail["confidence"] = best_alert["confidence"]
 
@@ -401,6 +404,23 @@ class DetectionGUI:
                 person_features = self._person_id.extract_features(frame, p["bbox"])
                 break
 
+        # DB 级去重：检查是否已有同一人的近期证据
+        if person_features:
+            similar_id, similar_conf = self._db.find_recent_similar_person(
+                cam.id, person_features, time_window=30)
+            if similar_id and best_alert["confidence"] <= similar_conf:
+                return  # 已有更高置信度的证据，跳过
+            if similar_id and best_alert["confidence"] > similar_conf:
+                # 替换为更高置信度的截图
+                alert_dir = "alerts"
+                os.makedirs(alert_dir, exist_ok=True)
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                img_path = os.path.join(alert_dir, f"{cam.id}_{best_alert['label']}_{ts}.jpg")
+                cv2.imwrite(img_path, frame)
+                self._db.replace_evidence_image(similar_id, img_path, best_alert["confidence"])
+                self._logger.info(f"替换证据: #{similar_id} -> 置信度 {best_alert['confidence']:.0%}")
+                return
+
         # 保存截图
         alert_dir = "alerts"
         os.makedirs(alert_dir, exist_ok=True)
@@ -409,7 +429,7 @@ class DetectionGUI:
         img_path = os.path.join(alert_dir, f"{cam.id}_{label}_{ts}.jpg")
         cv2.imwrite(img_path, frame)
 
-        # 写入数据库
+        # 写入数据库（含 BLOB 长期存储）
         self._db.add_evidence(
             cam.id, cam.name, f"person_{track_id}",
             img_path, label, best_alert["confidence"],
@@ -457,7 +477,10 @@ class DetectionGUI:
                 frame_idx += 1
 
                 # 将帧送入检测队列（非阻塞，队列满则丢弃旧帧）
-                self._detect_queue.put((cam, frame.copy()), block=False)
+                try:
+                    self._detect_queue.put_nowait((cam, frame.copy()))
+                except Exception:
+                    pass  # 队列满，丢弃旧帧（检测线程会处理最新帧）
 
                 # 从缓存获取最新检测结果并绘制
                 display_frame = frame.copy()

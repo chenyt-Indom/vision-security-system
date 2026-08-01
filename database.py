@@ -1,6 +1,7 @@
 """
 database.py - 本地 SQLite 数据库
 存储截图证据、管理员反馈、模型评分、强化学习数据
+v2: 图片BLOB长期保存 + 删除 + 标注 + 全量查询
 """
 import sqlite3, os, json, time
 from datetime import datetime
@@ -29,6 +30,7 @@ class FeedbackDB:
                     camera_name TEXT,
                     person_id TEXT,
                     image_path TEXT NOT NULL,
+                    image_blob BLOB,
                     label TEXT NOT NULL,
                     confidence REAL NOT NULL,
                     bbox TEXT,
@@ -37,6 +39,7 @@ class FeedbackDB:
                     admin_judgment TEXT DEFAULT 'pending',
                     admin_score INTEGER DEFAULT 0,
                     admin_note TEXT,
+                    admin_annotation TEXT,
                     judged_at TEXT,
                     created_at TEXT DEFAULT (datetime('now','localtime'))
                 )
@@ -86,16 +89,26 @@ class FeedbackDB:
 
     def add_evidence(self, camera_id, camera_name, person_id, image_path,
                      label, confidence, bbox, person_features):
-        """添加截图证据"""
+        """添加截图证据，同时保存图片BLOB用于长期存储"""
         with self._lock:
             conn = sqlite3.connect(self._db_path)
             c = conn.cursor()
+
+            # 读取图片二进制数据用于长期存储
+            image_blob = None
+            if os.path.exists(image_path):
+                try:
+                    with open(image_path, "rb") as f:
+                        image_blob = f.read()
+                except Exception:
+                    pass
+
             c.execute("""
                 INSERT INTO evidence (camera_id, camera_name, person_id, image_path,
-                    label, confidence, bbox, person_features, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (camera_id, camera_name, person_id, image_path, label,
-                  confidence, json.dumps(bbox), json.dumps(person_features),
+                    image_blob, label, confidence, bbox, person_features, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (camera_id, camera_name, person_id, image_path, image_blob,
+                  label, confidence, json.dumps(bbox), json.dumps(person_features),
                   datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
             eid = c.lastrowid
             conn.commit()
@@ -117,22 +130,147 @@ class FeedbackDB:
                 WHERE id=?
             """, (judgment, score, note, now, evidence_id))
 
-            # 获取证据信息
             c.execute("SELECT label, confidence, camera_id FROM evidence WHERE id=?", (evidence_id,))
             row = c.fetchone()
             if row:
                 label, confidence, cam_id = row
-                # 添加反馈记录
                 c.execute("""
                     INSERT INTO feedback (evidence_id, camera_id, label, confidence, was_correct)
                     VALUES (?, ?, ?, ?, ?)
                 """, (evidence_id, cam_id, label, confidence, 1 if is_correct else 0))
-
-                # 更新模型评分
                 self._update_model_score(c, label, is_correct)
 
             conn.commit()
             conn.close()
+
+    def annotate_evidence(self, evidence_id, annotation):
+        """管理员标注截图"""
+        with self._lock:
+            conn = sqlite3.connect(self._db_path)
+            c = conn.cursor()
+            c.execute("UPDATE evidence SET admin_annotation=? WHERE id=?", (annotation, evidence_id))
+            conn.commit()
+            conn.close()
+
+    def delete_evidence(self, evidence_id):
+        """删除证据记录和关联的图片文件"""
+        with self._lock:
+            conn = sqlite3.connect(self._db_path)
+            c = conn.cursor()
+            c.execute("SELECT image_path FROM evidence WHERE id=?", (evidence_id,))
+            row = c.fetchone()
+            if row and row[0] and os.path.exists(row[0]):
+                try:
+                    os.remove(row[0])
+                except Exception:
+                    pass
+            c.execute("DELETE FROM feedback WHERE evidence_id=?", (evidence_id,))
+            c.execute("DELETE FROM evidence WHERE id=?", (evidence_id,))
+            conn.commit()
+            conn.close()
+
+    def get_evidence_by_id(self, evidence_id):
+        """获取单条证据"""
+        with self._lock:
+            conn = sqlite3.connect(self._db_path)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT * FROM evidence WHERE id=?", (evidence_id,))
+            row = c.fetchone()
+            conn.close()
+            return dict(row) if row else None
+
+    def get_all_evidence(self, filters=None, limit=100, offset=0):
+        """获取所有证据（支持筛选）"""
+        filters = filters or {}
+        with self._lock:
+            conn = sqlite3.connect(self._db_path)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            query = "SELECT * FROM evidence WHERE 1=1"
+            params = []
+
+            if "label" in filters and filters["label"]:
+                query += " AND label=?"
+                params.append(filters["label"])
+            if "camera_id" in filters and filters["camera_id"]:
+                query += " AND camera_id=?"
+                params.append(filters["camera_id"])
+            if "judgment" in filters and filters["judgment"]:
+                query += " AND admin_judgment=?"
+                params.append(filters["judgment"])
+            if "date_from" in filters and filters["date_from"]:
+                query += " AND timestamp >= ?"
+                params.append(filters["date_from"])
+            if "date_to" in filters and filters["date_to"]:
+                query += " AND timestamp <= ?"
+                params.append(filters["date_to"])
+
+            query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+
+            c.execute(query, params)
+            rows = [dict(r) for r in c.fetchall()]
+            conn.close()
+            return rows
+
+    def get_evidence_count(self, filters=None):
+        """获取证据总数"""
+        filters = filters or {}
+        with self._lock:
+            conn = sqlite3.connect(self._db_path)
+            c = conn.cursor()
+
+            query = "SELECT COUNT(*) FROM evidence WHERE 1=1"
+            params = []
+
+            if "label" in filters and filters["label"]:
+                query += " AND label=?"
+                params.append(filters["label"])
+            if "camera_id" in filters and filters["camera_id"]:
+                query += " AND camera_id=?"
+                params.append(filters["camera_id"])
+            if "judgment" in filters and filters["judgment"]:
+                query += " AND admin_judgment=?"
+                params.append(filters["judgment"])
+
+            c.execute(query, params)
+            count = c.fetchone()[0]
+            conn.close()
+            return count
+
+    def get_image_blob(self, evidence_id):
+        """从数据库获取图片BLOB（长期存储）"""
+        with self._lock:
+            conn = sqlite3.connect(self._db_path)
+            c = conn.cursor()
+            c.execute("SELECT image_blob FROM evidence WHERE id=?", (evidence_id,))
+            row = c.fetchone()
+            conn.close()
+            if row and row[0]:
+                return row[0]
+            return None
+
+    def get_all_labels(self):
+        """获取所有标签类型"""
+        with self._lock:
+            conn = sqlite3.connect(self._db_path)
+            c = conn.cursor()
+            c.execute("SELECT DISTINCT label FROM evidence")
+            labels = [r[0] for r in c.fetchall()]
+            conn.close()
+            return labels
+
+    def get_all_cameras(self):
+        """获取所有摄像头"""
+        with self._lock:
+            conn = sqlite3.connect(self._db_path)
+            c = conn.cursor()
+            c.execute("SELECT DISTINCT camera_id, camera_name FROM evidence")
+            cameras = [{"id": r[0], "name": r[1]} for r in c.fetchall()]
+            conn.close()
+            return cameras
 
     def _update_model_score(self, cursor, label, is_correct):
         """更新模型评分"""
@@ -172,7 +310,6 @@ class FeedbackDB:
             conn.close()
             if row:
                 accuracy, threshold = row
-                # 准确率高→降低阈值，准确率低→提高阈值
                 if accuracy >= 0.9:
                     return max(0.25, threshold - 0.02)
                 elif accuracy >= 0.8:
@@ -239,13 +376,33 @@ class FeedbackDB:
             return {"correct": correct, "incorrect": incorrect, "pending": pending,
                     "accuracy": acc, "total": total}
 
+    def get_feedback_stats(self):
+        """获取反馈统计数据（用于学习曲线）"""
+        with self._lock:
+            conn = sqlite3.connect(self._db_path)
+            c = conn.cursor()
+            c.execute("""
+                SELECT label, was_correct, COUNT(*) as cnt
+                FROM feedback GROUP BY label, was_correct
+            """)
+            rows = c.fetchall()
+            conn.close()
+            stats = {}
+            for label, was_correct, cnt in rows:
+                if label not in stats:
+                    stats[label] = {"correct": 0, "incorrect": 0}
+                if was_correct:
+                    stats[label]["correct"] = cnt
+                else:
+                    stats[label]["incorrect"] = cnt
+            return stats
+
     def find_recent_similar_person(self, camera_id, person_features, time_window=30):
         """查找近期相似人物（用于去重）"""
         with self._lock:
             conn = sqlite3.connect(self._db_path)
             c = conn.cursor()
-            cutoff = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # 查询时间窗口内的记录
+            now = datetime.now()
             c.execute("""
                 SELECT id, person_features, confidence, created_at FROM evidence
                 WHERE camera_id=? AND admin_judgment='pending'
@@ -282,10 +439,17 @@ class FeedbackDB:
         with self._lock:
             conn = sqlite3.connect(self._db_path)
             c = conn.cursor()
+            image_blob = None
+            if os.path.exists(new_image_path):
+                try:
+                    with open(new_image_path, "rb") as f:
+                        image_blob = f.read()
+                except Exception:
+                    pass
             c.execute("""
-                UPDATE evidence SET image_path=?, confidence=?
+                UPDATE evidence SET image_path=?, image_blob=?, confidence=?
                 WHERE id=?
-            """, (new_image_path, new_confidence, evidence_id))
+            """, (new_image_path, image_blob, new_confidence, evidence_id))
             conn.commit()
             conn.close()
 
