@@ -49,20 +49,31 @@ class KalmanBoxTracker:
         self._update_rois()
 
     def predict(self):
-        """Kalman预测下一帧位置"""
+        """Kalman预测下一帧位置 — 带验证钳位"""
         pred = self.kf.predict()
         cx, cy, s, r = pred[0, 0], pred[1, 0], pred[2, 0], pred[3, 0]
-        s = max(s, 100)
+
+        # 验证预测结果
+        s = max(s, 1000)          # 最小面积
+        r = max(min(r, 5.0), 0.2) # 宽高比限制在 0.2-5.0
         w = np.sqrt(s * r)
         h = s / max(w, 1)
         x1 = int(cx - w / 2)
         y1 = int(cy - h / 2)
         x2 = int(cx + w / 2)
         y2 = int(cy + h / 2)
+
+        # 钳位到有效范围
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = max(x1 + 10, x2)  # 至少10像素宽
+        y2 = max(y1 + 10, y2)  # 至少10像素高
+
         self.bbox = [x1, y1, x2, y2]
-        # 平滑过渡：EMA 平滑避免跳动
+
+        # EMA 平滑
         if self.smoothed_bbox:
-            alpha = 0.4  # 平滑系数（越小越平滑）
+            alpha = 0.4
             self.smoothed_bbox = [
                 int(alpha * self.bbox[i] + (1 - alpha) * self.smoothed_bbox[i])
                 for i in range(4)
@@ -73,12 +84,15 @@ class KalmanBoxTracker:
     def update(self, bbox: List[int], frame_idx: int):
         """用检测结果更新 Kalman"""
         x1, y1, x2, y2 = bbox
+        # 验证检测框有效性
+        if x2 <= x1 + 5 or y2 <= y1 + 5:
+            return  # 无效检测，跳过
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
         s = (x2 - x1) * (y2 - y1)
         r = (x2 - x1) / max(y2 - y1, 1)
         self.kf.correct(np.array([[cx], [cy], [s], [r]], dtype=np.float32))
-        self.bbox = bbox
+        self.bbox = [x1, y1, x2, y2]
         self.last_seen = frame_idx
         self.missed = 0
         self.hits += 1

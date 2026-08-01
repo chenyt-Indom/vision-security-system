@@ -497,9 +497,11 @@ class DetectionGUI:
                 if cam.id == self._selected_cam:
                     display_frame = frame.copy()
                     if result:
-                        # S1: 人体框 (绿色)
+                        # S1: 人体框 (绿色) — 验证有效性
                         for p in result["persons"]:
                             x1, y1, x2, y2 = p["bbox"]
+                            if x2 <= x1 + 10 or y2 <= y1 + 10:
+                                continue  # 跳过无效框
                             cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 220, 0), 2)
                             cv2.putText(display_frame, f"P#{p['id']}", (x1, y1 - 6),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 0), 1)
@@ -512,6 +514,8 @@ class DetectionGUI:
                         roi_names = {"mouth": "mouth", "hand_r": "R-hand", "hand_l": "L-hand", "hand": "hand"}
                         for roi in result["rois"]:
                             rx1, ry1, rx2, ry2 = roi["bbox"]
+                            if rx2 <= rx1 + 5 or ry2 <= ry1 + 5:
+                                continue
                             c = roi_colors.get(roi["type"], (200, 150, 50))
                             cv2.rectangle(display_frame, (rx1, ry1), (rx2, ry2), c, 2)
                             nm = roi_names.get(roi["type"], roi["type"])
