@@ -376,22 +376,30 @@ class DetectionGUI:
                 last_alert_time[person_key] = (now, alert["confidence"], alert["bbox"])
                 deduped_alerts.append(alert)
 
-            # 决策链：连续帧确认
+            # 决策链：空间推理 + 时间确认
             if deduped_alerts:
-                should_alert, detail = self._decision.evaluate(cam.id, deduped_alerts)
-                if should_alert:
-                    self._push_alert(cam, frame, result, deduped_alerts, detail)
+                level, detail = self._decision.evaluate(cam.id, deduped_alerts)
+                if level:
+                    self._push_alert(cam, frame, result, deduped_alerts, detail, level)
 
             # 记录毫秒级性能
             elapsed = (time.perf_counter() - t0) * 1000
             if elapsed > 20:
                 self._logger.info(f"检测耗时: {elapsed:.1f}ms")
 
-    def _push_alert(self, cam, frame, result, deduped_alerts, detail):
+    def _push_alert(self, cam, frame, result, deduped_alerts, detail, level):
         """即时推送告警：保存截图 + 写入数据库 + 更新前端"""
         best_alert = max(deduped_alerts, key=lambda a: a["confidence"])
         detail["detected_label"] = best_alert["label"]
         detail["confidence"] = best_alert["confidence"]
+        detail["level"] = level
+
+        # 可疑级别（hand_cigs_far）和确认抽烟（smoking）都入库
+        # 仅手近脸（hand_near）不入库，仅前端提示
+        if level == "hand_near":
+            self._root.after(0, lambda c=cam, d=detail: self._on_alert(c, d))
+            self._logger.info(f"手近脸提示: {cam.name}")
+            return
 
         # 提取人物特征
         person_features = {}
@@ -401,21 +409,20 @@ class DetectionGUI:
                 person_features = self._person_id.extract_features(frame, p["bbox"])
                 break
 
-        # DB 级去重：检查是否已有同一人的近期证据
+        # DB 级去重
         if person_features:
             similar_id, similar_conf = self._db.find_recent_similar_person(
                 cam.id, person_features, time_window=30)
             if similar_id and best_alert["confidence"] <= similar_conf:
-                return  # 已有更高置信度的证据，跳过
+                return
             if similar_id and best_alert["confidence"] > similar_conf:
-                # 替换为更高置信度的截图
                 alert_dir = "alerts"
                 os.makedirs(alert_dir, exist_ok=True)
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 img_path = os.path.join(alert_dir, f"{cam.id}_{best_alert['label']}_{ts}.jpg")
                 cv2.imwrite(img_path, frame)
                 self._db.replace_evidence_image(similar_id, img_path, best_alert["confidence"])
-                self._logger.info(f"替换证据: #{similar_id} -> 置信度 {best_alert['confidence']:.0%}")
+                self._logger.info(f"替换证据: #{similar_id} -> {best_alert['confidence']:.0%}")
                 return
 
         # 保存截图
@@ -426,7 +433,7 @@ class DetectionGUI:
         img_path = os.path.join(alert_dir, f"{cam.id}_{label}_{ts}.jpg")
         cv2.imwrite(img_path, frame)
 
-        # 写入数据库（含 BLOB 长期存储）
+        # 写入数据库（含 BLOB 长期存储 + 级别标记）
         self._db.add_evidence(
             cam.id, cam.name, f"person_{track_id}",
             img_path, label, best_alert["confidence"],
@@ -434,7 +441,8 @@ class DetectionGUI:
 
         # 更新前端告警列表
         self._root.after(0, lambda c=cam, d=detail: self._on_alert(c, d))
-        self._logger.info(f"告警推送: {cam.name} {label} {best_alert['confidence']:.0%}")
+        level_cn = "确认抽烟" if level == "smoking" else "可疑"
+        self._logger.info(f"[{level_cn}] {cam.name} {label} {best_alert['confidence']:.0%}")
 
     # ================================================================
     #  显示主循环 — 极速帧读取 + 轻量检测框绘制
@@ -510,16 +518,29 @@ class DetectionGUI:
                             cv2.putText(display_frame, f"{nm}#{roi['track_id']}", (rx1, ry1 - 4),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, c, 1)
 
-                        # S3: 告警框 (红色/橙色)
+                        # S3: 告警框 (空间推理着色)
                         for alert in result["alerts"]:
                             if alert["confidence"] < self._rl.get_threshold(alert["label"]):
                                 continue
                             ax1, ay1, ax2, ay2 = alert["bbox"]
-                            color = (0, 165, 255) if "pack" in alert["label"] else (0, 0, 255)
-                            cv2.rectangle(display_frame, (ax1, ay1), (ax2, ay2), color, 2)
-                            txt = f"{alert['label']} {alert['confidence']:.0%}"
-                            cv2.putText(display_frame, txt, (ax1, ay1 - 6),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                            roi_type = alert.get("roi_type", "")
+                            overlap = alert.get("hand_mouth_overlap", 0.0)
+
+                            # 空间推理着色
+                            if roi_type == "mouth":
+                                color, level_tag = (0, 0, 255), "SMOKING"  # 嘴部有烟=确认
+                            elif roi_type in ("hand_r", "hand_l") and overlap > 0.1:
+                                color, level_tag = (0, 0, 255), "SMOKING"  # 手近脸+持烟=确认
+                            elif roi_type in ("hand_r", "hand_l"):
+                                color, level_tag = (0, 165, 255), "SUSPICIOUS"  # 持烟但手远离脸=可疑
+                            else:
+                                color, level_tag = (0, 165, 255), "ALERT"
+
+                            cv2.rectangle(display_frame, (ax1, ay1), (ax2, ay2), color, 3)
+                            txt = f"{level_tag}: {alert['label']} {alert['confidence']:.0%}"
+                            cv2.rectangle(display_frame, (ax1, ay1 - 22), (ax2, ay1), color, -1)
+                            cv2.putText(display_frame, txt, (ax1 + 2, ay1 - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
                     # FPS 显示
                     if self._perf_cfg.get("display_fps", True):

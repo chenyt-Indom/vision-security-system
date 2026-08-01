@@ -90,7 +90,7 @@ class MultiStageDetector:
         # === 人体追踪 ===
         tracked = self._tracker.update(person_dets)
 
-        # === S2-S3: 精准 ROI 检测 + 帧跳过 ===
+        # === S2-S3: 精准 ROI 检测 + 帧跳过 + 空间推理 ===
         all_alerts = []
         all_rois = []
 
@@ -100,6 +100,16 @@ class MultiStageDetector:
                 self._person_frame_counters[tid] = 0
             self._person_frame_counters[tid] += 1
             do_smoke = self._person_frame_counters[tid] % self._skip_interval == 0
+
+            # 计算手-嘴重叠度（用于空间推理：区分抽烟和手近脸）
+            hand_mouth_overlap = 0.0
+            if track.mouth_roi and (track.hand_roi or track.hand_left_roi):
+                mr = [max(0, v) for v in track.mouth_roi]
+                for hr in [track.hand_roi, track.hand_left_roi]:
+                    if hr:
+                        hrc = [max(0, v) for v in hr]
+                        hand_mouth_overlap = max(hand_mouth_overlap,
+                                                 self._roi_overlap(mr, hrc))
 
             # 嘴部 ROI
             mr = track.mouth_roi
@@ -113,7 +123,8 @@ class MultiStageDetector:
                             "label": sd["label"], "confidence": sd["confidence"],
                             "bbox": [int(mx1 + sd["bbox"][0]), int(my1 + sd["bbox"][1]),
                                      int(mx1 + sd["bbox"][2]), int(my1 + sd["bbox"][3])],
-                            "track_id": tid,
+                            "track_id": tid, "roi_type": "mouth",
+                            "hand_mouth_overlap": hand_mouth_overlap,
                         })
 
             # 右手 ROI
@@ -128,7 +139,8 @@ class MultiStageDetector:
                             "label": sd["label"], "confidence": sd["confidence"],
                             "bbox": [int(hx1 + sd["bbox"][0]), int(hy1 + sd["bbox"][1]),
                                      int(hx1 + sd["bbox"][2]), int(hy1 + sd["bbox"][3])],
-                            "track_id": tid,
+                            "track_id": tid, "roi_type": "hand_r",
+                            "hand_mouth_overlap": hand_mouth_overlap,
                         })
 
             # 左手 ROI
@@ -143,7 +155,8 @@ class MultiStageDetector:
                             "label": sd["label"], "confidence": sd["confidence"],
                             "bbox": [int(lx1 + sd["bbox"][0]), int(ly1 + sd["bbox"][1]),
                                      int(lx1 + sd["bbox"][2]), int(ly1 + sd["bbox"][3])],
-                            "track_id": tid,
+                            "track_id": tid, "roi_type": "hand_l",
+                            "hand_mouth_overlap": hand_mouth_overlap,
                         })
 
         # 清理不活跃的计数器
@@ -287,3 +300,15 @@ class MultiStageDetector:
         x2 = max(1, min(x2, img_w))
         y2 = max(1, min(y2, img_h))
         return x1, y1, x2, y2
+
+    @staticmethod
+    def _roi_overlap(roi_a, roi_b):
+        """计算两个ROI的IoU重叠度（0-1），用于手-嘴空间推理"""
+        x1 = max(roi_a[0], roi_b[0])
+        y1 = max(roi_a[1], roi_b[1])
+        x2 = min(roi_a[2], roi_b[2])
+        y2 = min(roi_a[3], roi_b[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area_a = max(1, (roi_a[2] - roi_a[0]) * (roi_a[3] - roi_a[1]))
+        area_b = max(1, (roi_b[2] - roi_b[0]) * (roi_b[3] - roi_b[1]))
+        return inter / min(area_a, area_b)  # 用较小面积做分母，更敏感
