@@ -1,0 +1,5 @@
+path: D:\firefightAI\chouyanjiance\smoking-detection\datasets\smoking
+train: images/train
+val: images/val
+nc: 2
+names: ['cigarette', 'cigarette_pack']

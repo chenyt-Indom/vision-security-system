@@ -1,0 +1,119 @@
+"""
+camera_manager.py - 多摄像头异步帧采集管线
+支持本地摄像头、RTSP 流、视频文件
+每路独立线程采集，毫秒级帧缓冲
+"""
+import cv2
+import threading
+import time
+import numpy as np
+from queue import Queue, Empty
+from typing import Optional, List
+
+
+class CameraManager:
+    """多摄像头管理器"""
+
+    def __init__(self, cameras_config: list):
+        self._cameras = [Camera(cfg) for cfg in cameras_config]
+
+    @property
+    def active_cameras(self) -> List:
+        return [c for c in self._cameras if c.enabled]
+
+    @property
+    def all_cameras(self) -> List:
+        return self._cameras
+
+    def add(self, config: dict):
+        self._cameras.append(Camera(config))
+
+    def stop_all(self):
+        for cam in self._cameras:
+            cam.stop()
+
+
+class Camera:
+    """单个摄像头 - 独立采集线程"""
+
+    def __init__(self, config: dict):
+        self.id = config["id"]
+        self.name = config["name"]
+        self.source = config["source"]
+        self.enabled = config.get("enabled", True)
+        self.roi = config.get("roi")
+        self._cap: Optional[cv2.VideoCapture] = None
+        self._queue = Queue(maxsize=2)  # 只保留最新帧，减小延迟
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._fps = 0.0
+        self._frame_count = 0
+        self._last_fps_time = time.time()
+
+    def start(self):
+        """启动摄像头采集"""
+        source = int(self.source) if isinstance(self.source, int) else self.source
+        self._cap = cv2.VideoCapture(source)
+        if not self._cap.isOpened():
+            raise RuntimeError(f"无法打开摄像头: {self.name} ({self.source})")
+
+        # 设置缓冲区大小以降低延迟
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        """采集主循环"""
+        while self._running and self._cap and self._cap.isOpened():
+            ret, frame = self._cap.read()
+            if not ret:
+                continue
+
+            # ROI 裁剪
+            if self.roi:
+                x, y, w, h = self.roi
+                frame = frame[y:y + h, x:x + w]
+
+            # 丢旧帧，只保留最新帧（确保低延迟）
+            if self._queue.full():
+                try:
+                    self._queue.get_nowait()
+                except Empty:
+                    pass
+            self._queue.put(frame)
+
+            # FPS 统计
+            self._frame_count += 1
+            now = time.time()
+            elapsed = now - self._last_fps_time
+            if elapsed >= 1.0:
+                self._fps = self._frame_count / elapsed
+                self._frame_count = 0
+                self._last_fps_time = now
+
+    def read(self) -> Optional[np.ndarray]:
+        """非阻塞读取最新帧"""
+        try:
+            return self._queue.get_nowait()
+        except Empty:
+            return None
+
+    def read_blocking(self, timeout: float = 0.1) -> Optional[np.ndarray]:
+        """阻塞读取（带超时）"""
+        try:
+            return self._queue.get(timeout=timeout)
+        except Empty:
+            return None
+
+    @property
+    def fps(self) -> float:
+        return self._fps
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        if self._cap:
+            self._cap.release()
