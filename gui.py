@@ -492,14 +492,23 @@ class DetectionGUI:
                         # S1: 人体框 (绿色)
                         for p in result["persons"]:
                             x1, y1, x2, y2 = p["bbox"]
-                            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
+                            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 220, 0), 2)
                             cv2.putText(display_frame, f"P#{p['id']}", (x1, y1 - 6),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 1)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 0), 1)
 
-                        # S2: ROI (蓝色虚线 - 简化绘制)
+                        # S2: 精准 ROI (嘴部=蓝色, 右手=黄色, 左手=青色)
+                        roi_colors = {
+                            "mouth": (220, 120, 0), "hand_r": (0, 200, 220), "hand_l": (220, 200, 0),
+                            "hand": (200, 150, 50)  # fallback
+                        }
+                        roi_names = {"mouth": "mouth", "hand_r": "R-hand", "hand_l": "L-hand", "hand": "hand"}
                         for roi in result["rois"]:
                             rx1, ry1, rx2, ry2 = roi["bbox"]
-                            cv2.rectangle(display_frame, (rx1, ry1), (rx2, ry2), (200, 150, 50), 1)
+                            c = roi_colors.get(roi["type"], (200, 150, 50))
+                            cv2.rectangle(display_frame, (rx1, ry1), (rx2, ry2), c, 2)
+                            nm = roi_names.get(roi["type"], roi["type"])
+                            cv2.putText(display_frame, f"{nm}#{roi['track_id']}", (rx1, ry1 - 4),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, c, 1)
 
                         # S3: 告警框 (红色/橙色)
                         for alert in result["alerts"]:

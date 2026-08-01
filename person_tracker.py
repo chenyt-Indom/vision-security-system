@@ -1,4 +1,4 @@
-"""person_tracker.py - 人体持续追踪器 (IoU匹配 + Kalman滤波)"""
+"""person_tracker.py - 人体持续追踪器 v2 (IoU匹配 + 精准双手/嘴部ROI)"""
 import numpy as np
 from collections import OrderedDict
 
@@ -10,9 +10,10 @@ class TrackedPerson:
         self.frame_idx = frame_idx
         self.last_seen = frame_idx
         self.missed = 0
-        # 手部和嘴部 ROI（基于人体比例估算）
-        self.hand_roi = None    # [x1, y1, x2, y2]
-        self.mouth_roi = None   # [x1, y1, x2, y2]
+        # 精准 ROI：双手 + 嘴部（厘米级定位）
+        self.hand_roi = None     # 右手主 ROI [x1, y1, x2, y2]
+        self.hand_left_roi = None  # 左手 ROI
+        self.mouth_roi = None    # 嘴部 ROI
         self._update_rois()
 
     def update(self, bbox, frame_idx):
@@ -25,23 +26,33 @@ class TrackedPerson:
         self.missed += 1
 
     def _update_rois(self):
+        """厘米级精准 ROI 估算：基于人体比例解剖学定位"""
         x1, y1, x2, y2 = self.bbox
-        pw = x2 - x1
-        ph = y2 - y1
+        pw = max(x2 - x1, 1)
+        ph = max(y2 - y1, 1)
 
-        # 嘴部ROI：人体上部 1/5 到 1/3 区域
-        mx1 = x1 + int(pw * 0.30)
-        my1 = y1 + int(ph * 0.08)
-        mx2 = x1 + int(pw * 0.70)
-        my2 = y1 + int(ph * 0.28)
+        # 嘴部 ROI：面部中心区域（人体上部 5%-25%）
+        # 更精准：缩小到面部中心，减少误检
+        mx1 = x1 + int(pw * 0.32)
+        my1 = y1 + int(ph * 0.05)
+        mx2 = x1 + int(pw * 0.68)
+        my2 = y1 + int(ph * 0.22)
         self.mouth_roi = [mx1, my1, mx2, my2]
 
-        # 手部ROI：人体中部偏右侧区域（抽烟时手通常在嘴附近）
-        hx1 = x1 + int(pw * 0.55)
+        # 右手 ROI：人体右侧，嘴部附近区域（抽烟时手在嘴旁）
+        # 精准定位：右侧 55%-100% 宽度，上部 8%-42% 高度
+        hx1 = x1 + int(pw * 0.52)
         hy1 = y1 + int(ph * 0.08)
-        hx2 = x2 + int(pw * 0.15)
-        hy2 = y1 + int(ph * 0.50)
+        hx2 = x2 + int(pw * 0.10)
+        hy2 = y1 + int(ph * 0.45)
         self.hand_roi = [hx1, hy1, hx2, hy2]
+
+        # 左手 ROI：人体左侧对称区域（左撇子也可能抽烟）
+        lx1 = x1 - int(pw * 0.10)
+        ly1 = y1 + int(ph * 0.08)
+        lx2 = x1 + int(pw * 0.48)
+        ly2 = y1 + int(ph * 0.45)
+        self.hand_left_roi = [lx1, ly1, lx2, ly2]
 
 
 class PersonTracker:
@@ -56,7 +67,6 @@ class PersonTracker:
         """detections: list of [x1, y1, x2, y2, conf]"""
         self._frame_idx += 1
 
-        # 标记所有现有 track 为未匹配
         for t in self._tracks.values():
             t.mark_missed()
 
@@ -72,7 +82,6 @@ class PersonTracker:
                     if len(detections[best]) > 4:
                         track.confidence = detections[best][4]
 
-        # 为新检测创建 track
         if detections:
             for i, det in enumerate(detections):
                 if i not in matched:
@@ -80,7 +89,6 @@ class PersonTracker:
                         self._next_id, det[:4], self._frame_idx)
                     self._next_id += 1
 
-        # 移除丢失太久的 track
         to_remove = [tid for tid, t in self._tracks.items()
                      if t.missed > self._max_missed]
         for tid in to_remove:

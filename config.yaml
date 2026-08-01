@@ -1,6 +1,6 @@
 # ============================================================
-# AI 抽烟检测系统 - 配置文件
-# 安防级毫秒级本地推理
+# AI 抽烟检测系统 - 配置文件 v2
+# 安防级毫秒级本地推理 - 极速版
 # ============================================================
 
 cameras:
@@ -17,36 +17,36 @@ cameras:
 # 模型配置 - 本地 ONNX 推理，零网络依赖
 # ============================================================
 model:
-  person_model: "models/yolov8n.onnx"        # S1: 人体检测模型 (YOLOv8n, COCO 80类)
-  smoking_model: "models/smoking.onnx"        # S3: 香烟+烟盒检测 (2类: cigarette, cigarette_pack)
-  confidence_threshold: 0.35                  # 置信度阈值
-  iou_threshold: 0.45                         # NMS IOU 阈值
+  person_model: "models/yolov8n.onnx"
+  smoking_model: "models/smoking.onnx"
+  confidence_threshold: 0.30
+  iou_threshold: 0.45
 
 # ============================================================
 # 性能调优 - 毫秒级检测关键参数
 # ============================================================
 performance:
-  inference_interval: 1                     # 异步检测，每帧送入检测队列（推荐保持1）
-  display_interval: 1                       # 每帧刷新GUI（异步架构下不影响检测速度）
-  max_queue_size: 2                         # 帧缓冲队列大小
-  display_fps: true                         # 是否在画面上显示 FPS
-  display_width: 640                        # 显示画面宽度
-  display_height: 480                       # 显示画面高度
-  warmup_frames: 10                         # 模型预热帧数
+  inference_interval: 1
+  display_interval: 1
+  max_queue_size: 3
+  display_fps: true
+  display_width: 640
+  display_height: 480
+  warmup_frames: 10
 
 # ============================================================
-# 决策链 - 毫秒级响应，防误报
+# 决策链 - 1帧确认 + 1秒冷却 = 毫秒级报警
 # ============================================================
 decision:
-  confirm_frames: 2                         # 连续检测到 N 帧即触发告警（降低到2帧=毫秒级响应）
-  confirm_window_seconds: 1                 # 滑动时间窗口（1秒内）
-  cooldown_seconds: 5                       # 同一摄像头告警冷却时间（5秒）
+  confirm_frames: 1
+  confirm_window_seconds: 0.5
+  cooldown_seconds: 3
 
 # ============================================================
 # 告警配置
 # ============================================================
 alert:
-  save_screenshot: true                     # 触发告警时保存截图证据
+  save_screenshot: true
   screenshot_dir: "alerts"
 
 # ============================================================
@@ -63,6 +63,6 @@ logging:
 ui:
   title: "AI 抽烟检测系统 - 安防智能体"
   window_size: [1280, 720]
-  refresh_interval_ms: 33                   # ~30fps 显示刷新
+  refresh_interval_ms: 16
   alert_history_max: 100
-  primary_color: "#1E5AA8"                  # 深蓝国企风格
+  primary_color: "#1E5AA8"
