@@ -26,18 +26,21 @@ model:
 # 性能调优 - 毫秒级检测关键参数
 # ============================================================
 performance:
-  inference_interval: 1                     # 每 N 帧推理一次（1=每帧都推理）
-  max_queue_size: 2                         # 帧缓冲队列大小（避免内存堆积）
+  inference_interval: 1                     # 异步检测，每帧送入检测队列（推荐保持1）
+  display_interval: 1                       # 每帧刷新GUI（异步架构下不影响检测速度）
+  max_queue_size: 2                         # 帧缓冲队列大小
   display_fps: true                         # 是否在画面上显示 FPS
+  display_width: 640                        # 显示画面宽度
+  display_height: 480                       # 显示画面高度
   warmup_frames: 10                         # 模型预热帧数
 
 # ============================================================
-# 决策链 - 防误报，安防级可靠性
+# 决策链 - 毫秒级响应，防误报
 # ============================================================
 decision:
-  confirm_frames: 5                         # 连续检测到多少帧才触发告警
-  confirm_window_seconds: 3                 # 滑动时间窗口
-  cooldown_seconds: 10                      # 同一摄像头告警冷却时间
+  confirm_frames: 2                         # 连续检测到 N 帧即触发告警（降低到2帧=毫秒级响应）
+  confirm_window_seconds: 1                 # 滑动时间窗口（1秒内）
+  cooldown_seconds: 5                       # 同一摄像头告警冷却时间（5秒）
 
 # ============================================================
 # 告警配置

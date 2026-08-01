@@ -28,6 +28,21 @@ class CameraManager:
     def add(self, config: dict):
         self._cameras.append(Camera(config))
 
+    def remove(self, cam_id: str):
+        cam = next((c for c in self._cameras if c.id == cam_id), None)
+        if cam:
+            cam.stop()
+            self._cameras.remove(cam)
+
+    def to_config_list(self) -> list:
+        """导出为配置列表（用于保存到 config.yaml）"""
+        return [{
+            "id": c.id,
+            "name": c.name,
+            "source": c.source,
+            "enabled": c.enabled,
+        } for c in self._cameras]
+
     def stop_all(self):
         for cam in self._cameras:
             cam.stop()
@@ -53,11 +68,15 @@ class Camera:
     def start(self):
         """启动摄像头采集"""
         source = int(self.source) if isinstance(self.source, int) else self.source
-        self._cap = cv2.VideoCapture(source)
+        self._cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
         if not self._cap.isOpened():
             raise RuntimeError(f"无法打开摄像头: {self.name} ({self.source})")
 
-        # 设置缓冲区大小以降低延迟
+        # 高帧率优化：设置 MJPG 编码 + 30 FPS
+        self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        self._cap.set(cv2.CAP_PROP_FPS, 30)
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         self._running = True

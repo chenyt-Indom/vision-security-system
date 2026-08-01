@@ -50,48 +50,54 @@ def build_exe():
 
     # 创建启动批处理
     run_bat = os.path.join(DEST_DIR, "启动视觉安防系统.bat")
-    with open(run_bat, "w", encoding="gbk") as f:
-        f.write(f"""@echo off
-chcp 65001 >nul
-title {APP_NAME}
-echo ============================================
-echo   {APP_NAME}
-echo   启动中...
-echo ============================================
-echo.
-echo [1] 启动带界面的监控模式
-echo [2] 启动后台无界面模式
-echo [3] 打开管理员审核面板
-echo [4] 退出
-echo.
-set /p choice="请选择 (1-4): "
-if "%choice%"=="1" goto gui
-if "%choice%"=="2" goto headless
-if "%choice%"=="3" goto admin
-if "%choice%"=="4" goto end
-goto end
-
-:gui
-echo 启动带界面监控模式...
-python main.py
-goto end
-
-:headless
-echo 启动后台无界面模式...
-echo 系统将在后台运行，截图保存到 alerts 目录
-echo 按 Ctrl+C 停止
-python headless_mode.py
-goto end
-
-:admin
-echo 启动管理员审核面板...
-python -c "from database import FeedbackDB; from reinforcement import ReinforcementLearner; from admin_panel import AdminPanel; import tkinter as tk; db=FeedbackDB('alerts/feedback.db'); rl=ReinforcementLearner(db); root=tk.Tk(); root.withdraw(); panel=AdminPanel(db, rl, None); root.mainloop()"
-goto end
-
-:end
-echo 再见!
-pause
-""")
+    python_path = sys.executable
+    lines = [
+        "@echo off",
+        f"title {APP_NAME}",
+        f"set PYTHON={python_path}",
+        f'cd /d "{DEST_DIR}"',
+        "",
+        "echo ============================================",
+        f"echo   {APP_NAME}",
+        "echo ============================================",
+        "echo.",
+        "echo [1] 启动带界面的监控模式",
+        "echo [2] 启动后台无界面模式",
+        "echo [3] 打开管理员审核面板",
+        "echo [4] 退出",
+        "echo.",
+        'set /p choice="请选择 (1-4): "',
+        "",
+        'if "%choice%"=="1" goto gui',
+        'if "%choice%"=="2" goto headless',
+        'if "%choice%"=="3" goto admin',
+        'if "%choice%"=="4" goto end',
+        "goto end",
+        "",
+        ":gui",
+        "echo 启动带界面监控模式...",
+        "%PYTHON% main.py",
+        "goto end",
+        "",
+        ":headless",
+        "echo 启动后台无界面模式...",
+        "echo 系统将在后台运行，截图保存到 alerts 目录",
+        "echo 按 Ctrl+C 停止",
+        "%PYTHON% headless_mode.py",
+        "goto end",
+        "",
+        ":admin",
+        "echo 启动管理员审核面板...",
+        "%PYTHON% standalone_admin.py",
+        "goto end",
+        "",
+        ":end",
+        "echo 再见!",
+        "pause",
+    ]
+    content = "\r\n".join(lines) + "\r\n"
+    with open(run_bat, "wb") as f:
+        f.write(content.encode("gbk"))
     print(f"  启动脚本: 启动视觉安防系统.bat")
 
     # 创建桌面快捷方式
