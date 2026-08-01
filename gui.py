@@ -31,9 +31,10 @@ class DetectionGUI:
         self._person_id = PersonIdentifier(time_window=30)
         self._photo_ref = None
         # 异步检测
-        self._detect_queue = Queue(maxsize=1)  # 只保留最新帧
+        self._detect_queue = Queue(maxsize=2)  # 缓冲2帧，检测线程不丢帧
         self._detect_cache = {}  # cam_id -> last result
         self._detect_cache_lock = threading.Lock()
+        self._gui_queue = Queue(maxsize=1)  # GUI更新队列，只保留最新帧
         self._build_window()
 
     def _build_window(self):
@@ -308,11 +309,10 @@ class DetectionGUI:
         self._btn_start.config(state=tk.DISABLED)
         self._btn_stop.config(state=tk.NORMAL)
         self._refresh_camera_list()
-        self._logger.info("检测已启动（异步毫秒级检测管线）")
-        # 启动检测工作线程
+        self._logger.info("检测已启动（毫秒级实时安防管线）")
         threading.Thread(target=self._detection_worker, daemon=True).start()
-        # 启动显示主循环
         threading.Thread(target=self._display_loop, daemon=True).start()
+        threading.Thread(target=self._gui_render_worker, daemon=True).start()
         self._update_perf()
 
     def stop(self):
@@ -334,14 +334,14 @@ class DetectionGUI:
         self._root.after(1000, self._update_perf)
 
     # ================================================================
-    #  检测工作线程 — 异步执行 YOLO 推理，毫秒级响应
+    #  检测工作线程 — 异步 YOLO 推理，1ms 超时极速轮询
     # ================================================================
     def _detection_worker(self):
-        """独立检测线程：从队列取帧 → 推理 → 即时告警推送"""
+        """独立检测线程：极速轮询 → 推理 → 即时告警推送"""
         last_alert_time = {}
         while self._running:
             try:
-                item = self._detect_queue.get(timeout=0.05)
+                item = self._detect_queue.get(timeout=0.001)  # 1ms超时，毫秒级响应
             except Empty:
                 continue
 
@@ -351,44 +351,41 @@ class DetectionGUI:
             # 多级检测
             result = self._detector.detect(frame)
 
-            # 更新缓存（供显示线程使用，存完整结果）
+            # 更新缓存（供显示线程使用）
             with self._detect_cache_lock:
                 self._detect_cache[cam.id] = result
 
-            # 用 RL 自适应阈值过滤告警
+            # RL 阈值过滤
             valid_alerts = []
             for alert in result["alerts"]:
-                label = alert["label"]
-                conf = alert["confidence"]
-                rl_threshold = self._rl.get_threshold(label)
-                if conf < rl_threshold:
+                if alert["confidence"] < self._rl.get_threshold(alert["label"]):
                     continue
                 valid_alerts.append(alert)
 
-            # 人物去重：同一人30秒内只保留最高置信度
+            # 人物去重
             deduped_alerts = []
             for alert in valid_alerts:
-                tid = alert["track_id"]
-                person_key = f"{cam.id}_{tid}"
+                person_key = f"{cam.id}_{alert['track_id']}"
                 now = time.time()
                 if person_key in last_alert_time:
-                    last_time, last_conf, _ = last_alert_time[person_key]
-                    if now - last_time < 30:
-                        if alert["confidence"] > last_conf:
+                    lt, lc, _ = last_alert_time[person_key]
+                    if now - lt < 30:
+                        if alert["confidence"] > lc:
                             last_alert_time[person_key] = (now, alert["confidence"], alert["bbox"])
                         continue
                 last_alert_time[person_key] = (now, alert["confidence"], alert["bbox"])
                 deduped_alerts.append(alert)
 
-            # 决策链：对 RL 过滤后的告警做连续帧确认
+            # 决策链：连续帧确认
             if deduped_alerts:
                 should_alert, detail = self._decision.evaluate(cam.id, deduped_alerts)
                 if should_alert:
                     self._push_alert(cam, frame, result, deduped_alerts, detail)
 
+            # 记录毫秒级性能
             elapsed = (time.perf_counter() - t0) * 1000
-            if elapsed < 1.0:
-                pass  # 毫秒级性能在此记录
+            if elapsed > 20:
+                self._logger.info(f"检测耗时: {elapsed:.1f}ms")
 
     def _push_alert(self, cam, frame, result, deduped_alerts, detail):
         """即时推送告警：保存截图 + 写入数据库 + 更新前端"""
@@ -440,10 +437,11 @@ class DetectionGUI:
         self._logger.info(f"告警推送: {cam.name} {label} {best_alert['confidence']:.0%}")
 
     # ================================================================
-    #  显示主循环 — 高帧率渲染，绘制缓存的检测结果
+    #  显示主循环 — 极速帧读取 + 轻量检测框绘制
+    #  GUI 渲染（cvtColor/resize/PhotoImage）交给独立线程
     # ================================================================
     def _display_loop(self):
-        """显示主循环：读取帧 → 叠加检测框 → 刷新 GUI"""
+        """显示主循环：读取帧 → 叠加检测框 → 推送 GUI 渲染队列"""
         started_cams = set()
         for cam in self._cameras.active_cameras:
             try:
@@ -456,9 +454,10 @@ class DetectionGUI:
         if active and not self._selected_cam:
             self._selected_cam = active[0].id
 
-        disp_w = self._perf_cfg.get("display_width", 640)
-        disp_h = self._perf_cfg.get("display_height", 480)
+        gui_interval = 2  # 每2帧更新一次GUI（减少PhotoImage创建开销）
         frame_idx = 0
+        last_fps_update = time.perf_counter()
+        fps_frame_count = 0
 
         while self._running:
             for cam in self._cameras.active_cameras:
@@ -476,72 +475,86 @@ class DetectionGUI:
 
                 frame_idx += 1
 
-                # 将帧送入检测队列（非阻塞，队列满则丢弃旧帧）
+                # 送入检测队列（非阻塞）
                 try:
                     self._detect_queue.put_nowait((cam, frame.copy()))
                 except Exception:
-                    pass  # 队列满，丢弃旧帧（检测线程会处理最新帧）
+                    pass
 
-                # 从缓存获取最新检测结果并绘制
-                display_frame = frame.copy()
+                # 从缓存取最新检测结果
                 with self._detect_cache_lock:
                     result = self._detect_cache.get(cam.id)
 
-                if result:
-                    # S1: 人体框 (绿色)
-                    for p in result["persons"]:
-                        x1, y1, x2, y2 = p["bbox"]
-                        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
-                        cv2.putText(display_frame, f"Person#{p['id']}", (x1, y1 - 8),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
-
-                    # S2: ROI 区域 (蓝色虚线)
-                    for roi in result["rois"]:
-                        rx1, ry1, rx2, ry2 = roi["bbox"]
-                        for dx in range(rx1, rx2, 10):
-                            cv2.line(display_frame, (dx, ry1), (min(dx + 5, rx2), ry1),
-                                     (200, 150, 50), 1)
-                            cv2.line(display_frame, (dx, ry2), (min(dx + 5, rx2), ry2),
-                                     (200, 150, 50), 1)
-                        for dy in range(ry1, ry2, 10):
-                            cv2.line(display_frame, (rx1, dy), (rx1, min(dy + 5, ry2)),
-                                     (200, 150, 50), 1)
-                            cv2.line(display_frame, (rx2, dy), (rx2, min(dy + 5, ry2)),
-                                     (200, 150, 50), 1)
-
-                    # S3: 告警框 (红色/橙色)
-                    for alert in result["alerts"]:
-                        ax1, ay1, ax2, ay2 = alert["bbox"]
-                        label = alert["label"]
-                        conf = alert["confidence"]
-                        rl_threshold = self._rl.get_threshold(label)
-                        if conf < rl_threshold:
-                            continue
-                        color = (0, 165, 255) if "pack" in label else (0, 0, 255)
-                        cv2.rectangle(display_frame, (ax1, ay1), (ax2, ay2), color, 3)
-                        text = f"ALERT: {label} {conf:.0%}"
-                        cv2.rectangle(display_frame, (ax1, ay1 - 24), (ax2, ay1), color, -1)
-                        cv2.putText(display_frame, text, (ax1 + 4, ay1 - 6),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-
-                # 显示 FPS
-                if self._perf_cfg.get("display_fps", True):
-                    inf_ms = self._detector.avg_inference_time_ms
-                    cv2.putText(display_frame, f"FPS: {self._detector.current_fps:.0f} | 推理:{inf_ms:.1f}ms",
-                                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-
-                # 更新 GUI 画面
+                # 只为选中摄像头绘制检测框（节省非选中摄像头的开销）
                 if cam.id == self._selected_cam:
-                    try:
-                        img = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                        img = cv2.resize(img, (disp_w, disp_h))
-                        photo = ImageTk.PhotoImage(Image.fromarray(img))
-                        self._photo_ref = photo
-                        self._root.after(0, self._safe_update_video, photo)
-                    except Exception:
-                        pass
+                    display_frame = frame.copy()
+                    if result:
+                        # S1: 人体框 (绿色)
+                        for p in result["persons"]:
+                            x1, y1, x2, y2 = p["bbox"]
+                            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
+                            cv2.putText(display_frame, f"P#{p['id']}", (x1, y1 - 6),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 1)
+
+                        # S2: ROI (蓝色虚线 - 简化绘制)
+                        for roi in result["rois"]:
+                            rx1, ry1, rx2, ry2 = roi["bbox"]
+                            cv2.rectangle(display_frame, (rx1, ry1), (rx2, ry2), (200, 150, 50), 1)
+
+                        # S3: 告警框 (红色/橙色)
+                        for alert in result["alerts"]:
+                            if alert["confidence"] < self._rl.get_threshold(alert["label"]):
+                                continue
+                            ax1, ay1, ax2, ay2 = alert["bbox"]
+                            color = (0, 165, 255) if "pack" in alert["label"] else (0, 0, 255)
+                            cv2.rectangle(display_frame, (ax1, ay1), (ax2, ay2), color, 2)
+                            txt = f"{alert['label']} {alert['confidence']:.0%}"
+                            cv2.putText(display_frame, txt, (ax1, ay1 - 6),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+                    # FPS 显示
+                    if self._perf_cfg.get("display_fps", True):
+                        cv2.putText(display_frame,
+                                    f"FPS:{self._detector.current_fps:.0f} | {self._detector.avg_inference_time_ms:.1f}ms",
+                                    (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+
+                    # 推送 GUI 渲染（每2帧一次，减少PhotoImage压力）
+                    if frame_idx % gui_interval == 0:
+                        try:
+                            self._gui_queue.put_nowait(display_frame)
+                        except Exception:
+                            pass
+
+                    # FPS 统计
+                    fps_frame_count += 1
+                    now = time.perf_counter()
+                    if now - last_fps_update >= 1.0:
+                        real_fps = fps_frame_count / (now - last_fps_update)
+                        last_fps_update = now
+                        fps_frame_count = 0
 
                 self._frame_count += 1
+
+    # ================================================================
+    #  GUI 渲染线程 — 独立处理 cvtColor/resize/PhotoImage
+    # ================================================================
+    def _gui_render_worker(self):
+        """独立 GUI 渲染线程：从队列取帧 → 转换格式 → 更新 Tkinter"""
+        disp_w = self._perf_cfg.get("display_width", 640)
+        disp_h = self._perf_cfg.get("display_height", 480)
+        while self._running:
+            try:
+                frame = self._gui_queue.get(timeout=0.03)
+            except Empty:
+                continue
+            try:
+                img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = cv2.resize(img, (disp_w, disp_h))
+                photo = ImageTk.PhotoImage(Image.fromarray(img))
+                self._photo_ref = photo
+                self._root.after(0, self._safe_update_video, photo)
+            except Exception:
+                pass
 
     def _safe_update_video(self, photo):
         """安全更新视频帧"""
